@@ -2,7 +2,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Iterable
 from collections import defaultdict
-
+from crf_recognizer import CRFRecognizer
 
 # =========================================================
 # 1. Структура сущности
@@ -347,7 +347,7 @@ def build_engine() -> PIIDetectorEngine:
         ContextRegexRecognizer(
             name="phone_regex",
             entity_type="PHONE",
-            pattern=r"(?:\+7|8)[\s\-(]*\d{3}[\s\)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}",
+            pattern=r"\b(?:\+7|8)\s*\(?\d{3}\)?[\s-]*\d{3}[\s-]*\d{2}[\s-]*\d{2}\b",
             score=0.95,
             context_words=["телефон", "номер", "связаться"],
         ),
@@ -379,6 +379,9 @@ def build_engine() -> PIIDetectorEngine:
         ),
         NameHeuristicRecognizer(first_names=first_names, last_names=last_names),
         AddressHeuristicRecognizer(),
+
+        # ML-слой
+        CRFRecognizer("crf_pii_model.joblib", allowed_types={"NAME", "ADDRESS"}),
     ]
 
     return PIIDetectorEngine(recognizers)
