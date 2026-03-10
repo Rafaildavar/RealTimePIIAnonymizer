@@ -108,3 +108,5 @@ Real-time masking of personal data in LLM requests for banking assistants.
 ### Real-time demo
 ```bash
 python pii_realtime_cli.py
+```
+[Ссылка на задание](https://event.cu.ru/master-hackathon-ml2026?utm_source=ooh&utm_medium=smm.unp&utm_campaign=cu.events.master%2Fhackathon-ML&utm_term=itmo.master)
