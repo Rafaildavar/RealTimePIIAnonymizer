@@ -18,7 +18,6 @@ RULE_PATTERNS = [
 
 ENTITY_TAGS = {
     "PER": "[NAME]",
-    "ORG": "[ORG]",
     "LOC": "[ADDRESS]",
 }
 
