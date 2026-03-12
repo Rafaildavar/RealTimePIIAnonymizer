@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LLM Chat</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="chat-wrap">
+    <section class="chat-card">
+      <h1>LLM Chat</h1>
+      <div id="output" class="output" aria-live="polite"></div>
+      <form id="chat-form" class="chat-form">
+        <input id="message" name="message" type="text" placeholder="Введите сообщение..." autocomplete="off" required>
+        <button type="submit">Отправить</button>
+      </form>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+
