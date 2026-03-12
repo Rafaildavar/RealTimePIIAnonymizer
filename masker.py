@@ -3,6 +3,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
+from unmask import unmask_pii
 
 try:
     from natasha import (

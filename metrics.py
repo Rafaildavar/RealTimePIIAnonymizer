@@ -1,15 +1,17 @@
 import pandas as pd
 import re
-
+from masker import mask_pii, mask_pii_with_mapping
 from collections import Counter, defaultdict
 from typing import List, Tuple
 
-
 def extract_entities(text: str) -> List[Tuple[str, int, int]]:
-    '''Функция для извлечения сущностей из текста.
-    Возвращает список кортежей (сущность, начальная позиция, конечная позиция).'''
-
-    return [(m.group(), m.start(), m.end()) for m in re.finditer(r"\[(.*?)]", text)]
+    '''Функция для извлечения сущностей из текста.'''
+    entities = []
+    for m in re.finditer(r"\[(.*?)]", text):
+        entity = m.group()
+        entity = re.sub(r'_\d+\]$', ']', entity)  # [PHONE_1] -> [PHONE]
+        entities.append((entity, m.start(), m.end()))
+    return entities
 
 def confusion_matrix(target: pd.Series, pred: pd.Series) -> pd.DataFrame:
     """Считает TP/FP/FN для PII-плейсхолдеров
@@ -80,5 +82,14 @@ def metrics(target: pd.Series, pred: pd.Series) -> pd.DataFrame:
     return df_metrics
 
 if __name__ == '__main__':
-    df = pd.read_csv('data/simple_data.csv')
-    print(metrics(df.masked, df.masked))
+    df = pd.read_csv('data/simple_data_100.csv')
+    df['pred'] = None
+    df['mapping'] = None
+
+    for idx, row in df.iterrows():
+        res = mask_pii_with_mapping(row['original'])
+        df.at[idx, 'pred'] = res.masked_text
+        df.at[idx, 'mapping'] = res.mapping
+
+    print(df.info())
+    print(metrics(df.masked, df.pred))
