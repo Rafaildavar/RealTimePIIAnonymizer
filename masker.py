@@ -11,7 +11,7 @@ from natasha import (
 
 RULE_PATTERNS = [
     (re.compile(r"\b[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}\b"), "[EMAIL]"),
-    (re.compile(r"\b(?:\+7|8)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-()]*\d{2}[\s\-()]*\d{2}\b"), "[PHONE]"),
+    (re.compile(r"\b(?:\+7|8|7)[\s\-()]*\d{3}[\s\-()]*\d{3}[\s\-()]*\d{2}[\s\-()]*\d{2}\b"), "[PHONE]"),
     (re.compile(r"\b\d{4}[\s-]?\d{6}\b"), "[PASSPORT]"),
     (re.compile(r"\b(?:\d{4}[\s-]?){3}\d{4}\b"), "[CARD]"),
 ]
@@ -24,6 +24,7 @@ ENTITY_TAGS = {
 
 @lru_cache(maxsize=1)
 def _get_natasha_components():
+    '''Функция инициализирует и возвращает компоненты библиотеки Natasha для NER'''
     try:
         segmenter = Segmenter()
         emb = NewsEmbedding()
@@ -34,6 +35,7 @@ def _get_natasha_components():
 
 
 def _mask_with_rules(text: str) -> str:
+    '''Функция применяет регулярные выражения для замены персональных данных в тексте.'''
     masked = text
     for pattern, replacement in RULE_PATTERNS:
         masked = pattern.sub(replacement, masked)
@@ -41,6 +43,7 @@ def _mask_with_rules(text: str) -> str:
 
 
 def mask_pii(text: str) -> str:
+    '''Заменяет персональные данные в тексте, используя как регулярные выражения, так и NER'''
     masked = _mask_with_rules(text)
     components = _get_natasha_components()
     if components is None:
@@ -58,7 +61,10 @@ def mask_pii(text: str) -> str:
 
     return masked
 
-
 if __name__ == "__main__":
-    text = "Я Иван Иванов, мой email test@example.com, а карта 4276 1234 5678 9012"
-    print(mask_pii(text))
+    # text = "Я Иван Иванов, мой email test@example.com, а карта 4276 1234 5678 9012, номер телефона 79161234567"
+
+    text = 'Я Крылова Анна Ивановна, проживаю ул. Горького, д. 5, кв. 15'
+    masked = mask_pii(text)
+    print(masked)
+
