@@ -185,3 +185,14 @@ fabric.properties
 .idea
 
 .data
+
+# SpaCy models
+pii_spacy_model/
+pii_spacy_model_v2/
+pii_spacy_model_v3/
+*.joblib
+
+# Datasets
+*.tsv
+*.csv
+predictions.json
