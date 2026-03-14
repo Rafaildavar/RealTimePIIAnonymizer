@@ -32,6 +32,12 @@ from spacy.tokens import Doc, Span
 from spacy.training import Example
 from spacy.util import minibatch, compounding
 
+try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+
 warnings.filterwarnings("ignore", category=UserWarning)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -211,6 +217,7 @@ def _build_regex_rules() -> Dict[str, list]:
     # ---- MAG_STRIPE ----
     rules["MAG_STRIPE"] = [
         (re.compile(r"%B[\w\^/]+\?"), None),
+        (re.compile(r"\b\d{16}=\d{15,25}\b"), None),
         (re.compile(r"\b9F[0-9A-Fa-f]{2,}[0-9A-Fa-f]+\b"),
          re.compile(r"(?i)emv|магнит|track|полос|операци")),
     ]
@@ -286,7 +293,7 @@ def _build_regex_rules() -> Dict[str, list]:
     # ---- PASSPORT ----
     rules["PASSPORT"] = [
         (re.compile(r"\b\d{2}\s?\d{2}\s\d{6}\b"),
-         re.compile(r"(?i)паспорт|серия|номер")),
+         re.compile(r"(?i)паспорт|серии|серия")),
         (re.compile(
             r"(?:[ОоУу](?:правлени|тдел)\w*\s+)?(?:ОУФМС|УФМС|ФМС|МВД|ГУВД|ОВД|УВД)"
             r"[\w\s,.\-()]*?(?:(?:по|города?|обл(?:асти)?|респ(?:ублик[аие])?|р-на?|района?|край|края|"
@@ -338,6 +345,8 @@ def _build_regex_rules() -> Dict[str, list]:
         (re.compile(_DATE_DMY),
          re.compile(r"(?i)регистрац|пребыван|прописк|местожительств")),
         (re.compile(_DATE_TEXT),
+         re.compile(r"(?i)регистрац|пребыван|прописк|местожительств")),
+        (re.compile(r"\d{1,2}\s" + _MONTHS_RU),
          re.compile(r"(?i)регистрац|пребыван|прописк|местожительств")),
     ]
 
@@ -432,7 +441,8 @@ _ORG_CONTEXT = re.compile(r"(?i)расчётн|расчетн|р/с|органи
 @Language.factory("entity_merger")
 class EntityMerger:
     """Merges doc.spans['regex'] with doc.ents, prioritizing regex matches.
-    Also applies post-processing fixes for boundary issues."""
+    Also applies post-processing fixes for boundary issues.
+    Stores exact char-level results in doc.user_data['pii_entities']."""
 
     def __init__(self, nlp, name):
         pass
@@ -451,9 +461,11 @@ class EntityMerger:
         merged = _merge_entities(all_ents)
         merged = _postprocess_entities(text, merged)
 
+        doc.user_data["pii_entities"] = [(s, e, lbl) for s, e, lbl, _ in merged]
+
         final_spans = []
         for start, end, label, _ in merged:
-            span = doc.char_span(start, end, label=label, alignment_mode="contract")
+            span = doc.char_span(start, end, label=label, alignment_mode="expand")
             if span is not None and len(span) > 0:
                 final_spans.append(span)
 
@@ -464,9 +476,26 @@ class EntityMerger:
         return doc
 
 
+_ORG_KEYWORDS = re.compile(
+    r"(?i)организаци|юридич|компани|ооо\b|зао\b|пао\b|оао\b|ао\s*[\"«]|"
+    r"контрагент|реквизит|фирм|предприяти"
+)
+
+_ORG_DATA_MARKERS = re.compile(
+    r"(?i)кпп|огрн|бик\b|сменил\w*\s+адрес|юридическ\w*\s+адрес|"
+    r"почтов\w*\s+адрес|данные?\s+по\s+инн|данные?\s+для\b|"
+    r"актуальн\w*\s+инн|инн\s+актуальн|инн.*указан.*неверн|"
+    r"для\s+организаци\w*\s+с\s+инн|контрагент\w*\s+по\s+инн"
+)
+
+
 def _postprocess_entities(text: str, ents: List[Tuple]) -> List[Tuple]:
     """Fix common boundary issues after merge."""
     result = []
+    text_lower = text.lower()
+    has_org_context = bool(_ORG_KEYWORDS.search(text))
+    is_org_data_text = bool(_ORG_DATA_MARKERS.search(text))
+
     for start, end, label, source in ents:
         s, e = start, end
 
@@ -476,23 +505,71 @@ def _postprocess_entities(text: str, ents: List[Tuple]) -> List[Tuple]:
                 s += 1
             while e > s and text[e - 1] in _QUOTE_CHARS:
                 e -= 1
-            # Also strip trailing comma/period that got attached
             while e > s and text[e - 1] in (',', '.', ' '):
                 e -= 1
 
-        # Strip prepositions from REG_DATE
-        if label == "REG_DATE":
-            chunk = text[s:e]
-            m = _REG_DATE_PREFIX.match(chunk)
-            if m and m.group().strip():
-                s += m.end()
-
-        # Only reclassify BANK_ACCT→ORG_DATA when "расчётный/расчетный счёт" or "р/с"
-        # is directly adjacent (within 15 chars before the entity)
+        # BANK_ACCT → ORG_DATA
         if label == "BANK_ACCT":
-            before = text[max(0, s - 20):s]
-            if re.search(r"(?i)расчётн|расчетн|р/с", before):
+            before = text[max(0, s - 40):s].lower()
+            if re.search(r"расчётн|расчетн|р/с", before):
                 label = "ORG_DATA"
+            elif re.search(r"реквизит", before) and has_org_context:
+                label = "ORG_DATA"
+            elif is_org_data_text:
+                label = "ORG_DATA"
+
+        # INN → ORG_DATA
+        if label == "INN":
+            if is_org_data_text:
+                label = "ORG_DATA"
+
+        # CARD_EXP: strip "года" suffix if present (inconsistent in gold)
+        if label == "CARD_EXP":
+            chunk = text[s:e]
+            m_year_suffix = re.search(r"\s+года?$", chunk)
+            if m_year_suffix:
+                e = s + m_year_suffix.start()
+
+        # DRIVER_LIC ↔ PASSPORT disambiguation based on context
+        if label in ("DRIVER_LIC", "PASSPORT"):
+            full_lower = text_lower
+            has_passport_ctx = bool(re.search(
+                r"паспорт|серии\b|серия\b|выдан|паспортн", full_lower
+            ))
+            has_driver_ctx = bool(re.search(
+                r"водител|удостоверени|\bву\b|страхов|каско|осаго|"
+                r"автомобил|авто\b|транспорт|дтп|штраф.*гибдд|гибдд",
+                full_lower
+            ))
+            if label == "DRIVER_LIC" and has_passport_ctx and not has_driver_ctx:
+                label = "PASSPORT"
+            elif label == "PASSPORT" and has_driver_ctx and not has_passport_ctx:
+                label = "DRIVER_LIC"
+
+        # Strip trailing punctuation from API_KEY
+        if label == "API_KEY":
+            while e > s and text[e - 1] in ('.', ',', ';', ':', '!', '?', ' '):
+                e -= 1
+
+        # DOB: split full text dates into parts (day, month, year)
+        # because gold annotation is split ~50% of the time
+        if label == "DOB":
+            chunk = text[s:e]
+            m_text_date = re.match(
+                r'^(\d{1,2})\s+(' + _MONTHS_RU + r')\s+(\d{4})(?:\s+года?)?$',
+                chunk, re.I
+            )
+            if m_text_date:
+                day_s = s + m_text_date.start(1)
+                day_e = s + m_text_date.end(1)
+                mon_s = s + m_text_date.start(2)
+                mon_e = s + m_text_date.end(2)
+                yr_s = s + m_text_date.start(3)
+                yr_e = s + m_text_date.end(3)
+                result.append((day_s, day_e, "DOB", source))
+                result.append((mon_s, mon_e, "DOB", source))
+                result.append((yr_s, yr_e, "DOB", source))
+                continue
 
         if s < e:
             result.append((s, e, label, source))
@@ -500,17 +577,24 @@ def _postprocess_entities(text: str, ents: List[Tuple]) -> List[Tuple]:
 
 
 def _merge_entities(ents: List[Tuple]) -> List[Tuple]:
-    """Merge entities from regex and NER. Regex has priority."""
+    """Merge entities from regex and NER.
+    When overlapping: prefer longer span; if same length prefer regex."""
     if not ents:
         return []
-    priority = {"regex": 0, "ner": 1}
-    sorted_e = sorted(ents, key=lambda x: (x[0], -(x[1] - x[0]), priority.get(x[3], 2)))
+    sorted_e = sorted(ents, key=lambda x: (x[0], -(x[1] - x[0])))
     result = [sorted_e[0]]
     for e in sorted_e[1:]:
         prev = result[-1]
         if e[0] >= prev[1]:
             result.append(e)
-        elif e[3] == "regex" and prev[3] == "ner":
+            continue
+        prev_len = prev[1] - prev[0]
+        cur_len = e[1] - e[0]
+        if cur_len > prev_len:
+            result[-1] = e
+        elif cur_len == prev_len and e[3] == "regex" and prev[3] == "ner":
+            result[-1] = e
+        elif e[3] == "regex" and prev[3] == "ner" and cur_len >= prev_len * 0.8:
             result[-1] = e
     return result
 
@@ -633,11 +717,253 @@ def train_pipeline(
 
 
 # =====================================================================
+#  HYPERPARAMETER TUNING (Optuna)
+# =====================================================================
+
+def _build_pipeline_with_params(
+    hidden_width: int = 64,
+    ner_depth: int = 4,
+    ner_width: int = 96,
+    ner_maxout: int = 3,
+    ner_embed_size: int = 2000,
+    ner_window_size: int = 1,
+) -> Language:
+    """Build pipeline with custom NER architecture hyperparameters."""
+    logger.info("Loading ru_core_news_lg base model...")
+    nlp = spacy.load("ru_core_news_lg", exclude=["ner"])
+
+    nlp.add_pipe("regex_pii_matcher", before="tok2vec")
+
+    ner_config = {
+        "model": {
+            "@architectures": "spacy.TransitionBasedParser.v2",
+            "state_type": "ner",
+            "extra_state_tokens": False,
+            "hidden_width": hidden_width,
+            "maxout_pieces": 2,
+            "use_upper": True,
+            "nO": None,
+            "tok2vec": {
+                "@architectures": "spacy.HashEmbedCNN.v2",
+                "pretrained_vectors": None,
+                "width": ner_width,
+                "depth": ner_depth,
+                "embed_size": ner_embed_size,
+                "window_size": ner_window_size,
+                "maxout_pieces": ner_maxout,
+                "subword_features": True,
+            },
+        }
+    }
+    ner = nlp.add_pipe("ner", config=ner_config, last=True)
+    nlp.add_pipe("entity_merger", last=True)
+
+    for label in ALL_LABELS:
+        ner.add_label(label)
+
+    return nlp
+
+
+def _train_for_trial(
+    nlp: Language,
+    train_examples: List[Example],
+    dev_data: List[Dict],
+    n_epochs: int,
+    drop: float,
+    batch_start: float,
+    batch_end: float,
+    batch_compound: float,
+    learn_rate: float,
+    patience: int = 5,
+    trial=None,
+) -> float:
+    """Train NER and return best dev F1. Supports Optuna pruning."""
+    tok2vec_bytes = nlp.get_pipe("tok2vec").to_bytes()
+
+    get_examples = lambda: train_examples[:200]
+    with nlp.select_pipes(enable=["tok2vec", "ner"]):
+        nlp.initialize(get_examples)
+
+    nlp.get_pipe("tok2vec").from_bytes(tok2vec_bytes)
+
+    optimizer = nlp.create_optimizer()
+    optimizer.learn_rate = learn_rate
+
+    best_f1 = 0.0
+    no_improve = 0
+
+    for epoch in range(n_epochs):
+        random.shuffle(train_examples)
+        losses = {}
+        batches = minibatch(
+            train_examples,
+            size=compounding(batch_start, batch_end, batch_compound),
+        )
+
+        with nlp.select_pipes(enable=["tok2vec", "ner"]):
+            for batch in batches:
+                nlp.update(batch, sgd=optimizer, losses=losses, drop=drop)
+
+        dev_scores = evaluate_on_data(nlp, dev_data)
+        f1 = dev_scores["f1"]
+        logger.info(
+            "  [trial] Epoch %02d | loss=%.2f | P=%.3f R=%.3f F1=%.3f",
+            epoch, losses.get("ner", 0),
+            dev_scores["precision"], dev_scores["recall"], f1,
+        )
+
+        if trial is not None:
+            trial.report(f1, epoch)
+            if trial.should_prune():
+                raise optuna.TrialPruned()
+
+        if f1 > best_f1:
+            best_f1 = f1
+            no_improve = 0
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                logger.info("  [trial] Early stopping at epoch %d", epoch)
+                break
+
+    return best_f1
+
+
+def run_hyperparameter_tuning(
+    data_path: str,
+    dev_ratio: float = 0.2,
+    n_trials: int = 20,
+    tuning_epochs: int = 15,
+    study_name: str = "pii_ner_v5",
+    storage: Optional[str] = None,
+) -> Dict:
+    """Run Optuna hyperparameter search and return the best params."""
+    if not OPTUNA_AVAILABLE:
+        raise RuntimeError("optuna is not installed. Run: pip install optuna")
+
+    data = load_train_data(data_path)
+    train_data, dev_data = split_data(data, dev_ratio)
+
+    base_nlp = spacy.load("ru_core_news_lg", exclude=["ner"])
+    base_examples = prepare_examples(base_nlp, train_data)
+    logger.info("Prepared %d training examples for tuning", len(base_examples))
+
+    def objective(trial: optuna.Trial) -> float:
+        drop = trial.suggest_float("drop", 0.15, 0.5)
+        batch_start = trial.suggest_float("batch_start", 2.0, 8.0)
+        batch_end = trial.suggest_float("batch_end", 16.0, 64.0)
+        batch_compound = trial.suggest_float("batch_compound", 1.001, 1.01, log=True)
+        learn_rate = trial.suggest_float("learn_rate", 1e-4, 5e-3, log=True)
+        hidden_width = trial.suggest_categorical("hidden_width", [32, 64, 128])
+        ner_depth = trial.suggest_int("ner_depth", 2, 6)
+        ner_width = trial.suggest_categorical("ner_width", [64, 96, 128])
+        ner_maxout = trial.suggest_categorical("ner_maxout", [2, 3])
+        ner_embed_size = trial.suggest_categorical("ner_embed_size", [2000, 5000, 10000])
+        ner_window_size = trial.suggest_int("ner_window_size", 1, 2)
+
+        nlp = _build_pipeline_with_params(
+            hidden_width=hidden_width,
+            ner_depth=ner_depth,
+            ner_width=ner_width,
+            ner_maxout=ner_maxout,
+            ner_embed_size=ner_embed_size,
+            ner_window_size=ner_window_size,
+        )
+
+        train_examples = prepare_examples(nlp, train_data)
+
+        best_f1 = _train_for_trial(
+            nlp, train_examples, dev_data,
+            n_epochs=tuning_epochs,
+            drop=drop,
+            batch_start=batch_start,
+            batch_end=batch_end,
+            batch_compound=batch_compound,
+            learn_rate=learn_rate,
+            patience=4,
+            trial=trial,
+        )
+        return best_f1
+
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=3)
+    study = optuna.create_study(
+        study_name=study_name,
+        storage=storage,
+        direction="maximize",
+        pruner=pruner,
+        load_if_exists=True,
+    )
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
+
+    logger.info("=" * 60)
+    logger.info("BEST TRIAL: #%d  F1=%.4f", study.best_trial.number, study.best_value)
+    for k, v in study.best_params.items():
+        logger.info("  %s = %s", k, v)
+    logger.info("=" * 60)
+
+    return study.best_params
+
+
+def train_with_best_params(
+    data_path: str,
+    best_params: Dict,
+    dev_ratio: float = 0.2,
+    n_epochs: int = 30,
+    output_dir: str = "pii_spacy_model_v5",
+    full_train: bool = False,
+    patience: int = 7,
+):
+    """Train the final model v5 using the best hyperparameters from Optuna."""
+    data = load_train_data(data_path)
+
+    nlp = _build_pipeline_with_params(
+        hidden_width=best_params.get("hidden_width", 64),
+        ner_depth=best_params.get("ner_depth", 4),
+        ner_width=best_params.get("ner_width", 96),
+        ner_maxout=best_params.get("ner_maxout", 3),
+        ner_embed_size=best_params.get("ner_embed_size", 2000),
+        ner_window_size=best_params.get("ner_window_size", 1),
+    )
+
+    if full_train:
+        small_dev = data[:200]
+        nlp = train_pipeline(
+            nlp, data, small_dev,
+            n_epochs=n_epochs,
+            batch_size_start=best_params.get("batch_start", 4.0),
+            batch_size_end=best_params.get("batch_end", 32.0),
+            drop=best_params.get("drop", 0.35),
+            patience=patience,
+            output_dir=output_dir,
+        )
+    else:
+        train_data, dev_data = split_data(data, dev_ratio)
+        nlp = train_pipeline(
+            nlp, train_data, dev_data,
+            n_epochs=n_epochs,
+            batch_size_start=best_params.get("batch_start", 4.0),
+            batch_size_end=best_params.get("batch_end", 32.0),
+            drop=best_params.get("drop", 0.35),
+            patience=patience,
+            output_dir=output_dir,
+        )
+        logger.info("=== Final evaluation (v5) on dev set ===")
+        nlp_best = spacy.load(output_dir)
+        scores = evaluate_on_data(nlp_best, dev_data)
+        print_per_label_metrics(scores)
+
+    return nlp
+
+
+# =====================================================================
 #  EVALUATION  (strict micro-averaged F1)
 # =====================================================================
 
 def extract_entities_from_doc(doc: Doc) -> List[Tuple[int, int, str]]:
-    """Extract (start_char, end_char, label) from a processed doc."""
+    """Extract (start_char, end_char, label) from a processed doc.
+    Uses exact char-level data stored by EntityMerger when available."""
+    if "pii_entities" in doc.user_data:
+        return doc.user_data["pii_entities"]
     return [(ent.start_char, ent.end_char, ent.label_) for ent in doc.ents]
 
 
@@ -742,12 +1068,14 @@ def print_per_label_metrics(scores: Dict):
 # =====================================================================
 
 def predict_text(nlp, text: str) -> List[Tuple[int, int, str]]:
-    """Predict PII entities and return in competition format (full labels)."""
+    """Predict PII entities and return in competition format (full labels).
+    Uses exact char-level positions from EntityMerger."""
     doc = nlp(text)
+    entities = extract_entities_from_doc(doc)
     result = []
-    for ent in doc.ents:
-        full_label = LABEL_TO_FULL.get(ent.label_, ent.label_)
-        result.append((ent.start_char, ent.end_char, full_label))
+    for s, e, lbl in entities:
+        full_label = LABEL_TO_FULL.get(lbl, lbl)
+        result.append((s, e, full_label))
     return result
 
 
@@ -786,7 +1114,45 @@ def main():
     parser.add_argument("--dev-ratio", type=float, default=0.2, help="Dev split ratio")
     parser.add_argument("--full-train", action="store_true",
                         help="Train on full dataset (no dev split) for final submission")
+    parser.add_argument("--tune", action="store_true",
+                        help="Run Optuna hyperparameter tuning")
+    parser.add_argument("--tune-and-train", action="store_true",
+                        help="Tune hyperparameters, then train final model v5")
+    parser.add_argument("--n-trials", type=int, default=20,
+                        help="Number of Optuna trials")
+    parser.add_argument("--tuning-epochs", type=int, default=15,
+                        help="Epochs per trial during tuning")
+    parser.add_argument("--best-params", type=str, default=None,
+                        help="Path to JSON with best params (skip tuning)")
     args = parser.parse_args()
+
+    if args.tune or args.tune_and_train:
+        if args.best_params:
+            with open(args.best_params, "r") as f:
+                best_params = json.load(f)
+            logger.info("Loaded best params from %s", args.best_params)
+        else:
+            best_params = run_hyperparameter_tuning(
+                data_path=args.data,
+                dev_ratio=args.dev_ratio,
+                n_trials=args.n_trials,
+                tuning_epochs=args.tuning_epochs,
+            )
+            params_path = "best_params_v5.json"
+            with open(params_path, "w") as f:
+                json.dump(best_params, f, indent=2, ensure_ascii=False)
+            logger.info("Best params saved to %s", params_path)
+
+        if args.tune_and_train:
+            train_with_best_params(
+                data_path=args.data,
+                best_params=best_params,
+                dev_ratio=args.dev_ratio,
+                n_epochs=args.epochs,
+                output_dir="pii_spacy_model_v5",
+                full_train=args.full_train,
+            )
+        return
 
     if args.regex_only:
         logger.info("=== Regex-only evaluation ===")

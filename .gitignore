@@ -187,9 +187,7 @@ fabric.properties
 .data
 
 # SpaCy models
-pii_spacy_model/
-pii_spacy_model_v2/
-pii_spacy_model_v3/
+pii_spacy_model*/
 *.joblib
 
 # Datasets
